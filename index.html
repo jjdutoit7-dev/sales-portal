@@ -2763,6 +2763,7 @@ async function parseThenUploadSales(input) {
         pushTop30ToFrame();
       }
 
+      var period = new Date().toISOString().slice(0,7);
       var output = {};
       Object.keys(repAgg).forEach(function(rep) {
         var d = repAgg[rep];
@@ -2773,10 +2774,28 @@ async function parseThenUploadSales(input) {
                   gp_pct:c.revenue?Math.round(c.gp/c.revenue*10000)/10000:0,
                   invoices:Object.keys(c.invoices).length};
         }).sort(function(a,b){return b.revenue-a.revenue;});
+
+        // Build per-rep Top30 iframe data (customer × product matrix)
+        var repTop30 = null;
+        if (isLineItem) {
+          var repCustArr = Object.values(custProdMap).filter(function(c){ return c.rep === rep; });
+          var repProdSet = new Set();
+          repCustArr.forEach(function(c){ Object.keys(c.items).forEach(function(p){ repProdSet.add(p); }); });
+          var repLabels = Array.from(repProdSet);
+          repCustArr.forEach(function(c){ repLabels.forEach(function(p){ if(!c.items[p]) c.items[p]={rev:0,qty:0}; }); });
+          repCustArr.sort(function(a,b){ return b.total_rev - a.total_rev; });
+          repCustArr.forEach(function(c,i){
+            c.rank = i+1;
+            c.gp_pct = c.total_rev>0 ? parseFloat((c.total_gp/c.total_rev*100).toFixed(1)) : 0;
+          });
+          if (repCustArr.length > 0) repTop30 = {data: repCustArr, labels: repLabels, period: period};
+        }
+
         output[rep]={customers:custs,total_revenue:Math.round(d.total_revenue*100)/100,
                      total_gp:Math.round(d.total_gp*100)/100,total_cost:Math.round(d.total_cost*100)/100,
                      gp_pct:d.total_revenue?Math.round(d.total_gp/d.total_revenue*10000)/10000:0,
-                     customer_count:custs.length,period:new Date().toISOString().slice(0,7)};
+                     customer_count:custs.length,period:period,
+                     top30: repTop30};
       });
 
       var repCount = Object.keys(output).length;
@@ -2802,10 +2821,7 @@ async function parseThenUploadSales(input) {
         } else {
           status.textContent = '✅ Done — ' + repCount + ' reps, ' + matchedRows + ' rows matched (' + unmatchedRows + ' unmatched) saved to Supabase.';
         }
-        // Also persist Top 30 product data to Supabase
-        if (window._top30Data) {
-          await sb.from('app_settings').upsert({key:'top30_product_data', value: window._top30Data},{onConflict:'key'});
-        }
+
       } else {
         status.textContent = '✅ Saved locally (' + repCount + ' reps). Supabase not connected.';
       }
@@ -3008,15 +3024,10 @@ async function debugReloadSales() {
 }
 
 async function loadTop30Data() {
-  var sb = _sbClient();
-  if (!sb) return;
-  try {
-    var res = await sb.from('app_settings').select('value').eq('key','top30_product_data').single();
-    if (res.data && res.data.value) {
-      window._top30Data = res.data.value;
-      pushTop30ToFrame();
-    }
-  } catch(e) { console.warn('[SRP] loadTop30Data:', e); }
+  // top30 data is embedded in the rep's sales_data_all entry — just re-run loadMyRepSalesData
+  // which will push to iframe if top30 is present
+  if (window._top30Data) { pushTop30ToFrame(); return; }
+  await loadMyRepSalesData();
 }
 
 function pushTop30ToFrame() {
@@ -3096,6 +3107,31 @@ async function loadMyRepSalesData() {
     if (combined.length > 0) {
       window._mySalesData = { customers: combined, period: 'All Reps' };
       renderSalesKPIs();
+      // Admin top30: merge all reps' top30 labels+data
+      var adminCustMap = {};
+      var adminProdSet = new Set();
+      Object.values(allData).forEach(function(repData) {
+        if (!repData || !repData.top30 || !repData.top30.data) return;
+        repData.top30.labels.forEach(function(l){ adminProdSet.add(l); });
+        repData.top30.data.forEach(function(c) {
+          if (!adminCustMap[c.name]) adminCustMap[c.name] = {name:c.name,rep:c.rep||'',code:c.code||'',total_rev:0,total_gp:0,items:{}};
+          adminCustMap[c.name].total_rev += c.total_rev||0;
+          adminCustMap[c.name].total_gp  += c.total_gp||0;
+          Object.keys(c.items||{}).forEach(function(p){
+            if (!adminCustMap[c.name].items[p]) adminCustMap[c.name].items[p]={rev:0,qty:0};
+            adminCustMap[c.name].items[p].rev += c.items[p].rev||0;
+            adminCustMap[c.name].items[p].qty += c.items[p].qty||0;
+          });
+        });
+      });
+      var adminLabels = Array.from(adminProdSet);
+      var adminCustArr = Object.values(adminCustMap);
+      adminCustArr.sort(function(a,b){ return b.total_rev-a.total_rev; });
+      adminCustArr.forEach(function(c,i){ c.rank=i+1; c.gp_pct=c.total_rev>0?parseFloat((c.total_gp/c.total_rev*100).toFixed(1)):0; });
+      if (adminCustArr.length > 0) {
+        window._top30Data = {data: adminCustArr, labels: adminLabels, period: 'All Reps'};
+        pushTop30ToFrame();
+      }
     }
     return;
   }
@@ -3117,6 +3153,11 @@ async function loadMyRepSalesData() {
   if (hit && hit.customers && hit.customers.length > 0) {
     window._mySalesData = hit;
     renderSalesKPIs();
+    // Push per-rep Top30 product data to iframe
+    if (hit.top30 && hit.top30.data) {
+      window._top30Data = hit.top30;
+      pushTop30ToFrame();
+    }
   }
 }
 
