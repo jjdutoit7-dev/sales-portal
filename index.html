@@ -1877,8 +1877,10 @@ function printQuoteData(q) {
     f.src=URL.createObjectURL(b);
     // Listen for iframe ready signal, then push cached data
     window.addEventListener('message',function(e){
-      if(e.data&&e.data.type==='srp_top30_ready'&&window._top30Data){
-        try{f.contentWindow.postMessage({type:'srp_top30',payload:window._top30Data},'*');}catch(ex){}
+      if(e.data&&e.data.type==='srp_top30_ready'){
+        // iframe just loaded — push data if we have it, else load from Supabase
+        if(window._top30Data){ pushTop30ToFrame(); }
+        else { loadTop30Data(); }
       }
     });
   }
@@ -2655,18 +2657,26 @@ async function parseThenUploadSales(input) {
       var ws = wb.Sheets[wb.SheetNames[0]];
       var rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
 
-      var hdr = rows[0].map(function(c){ return String(c).toLowerCase().trim().replace(/[^a-z0-9]/g,''); });
-      var custCol=2, revCol=5, costCol=6, gpCol=7, invCol=1, prodCol=-1, qtyCol=-1;
+      var rawHdr = rows[0].map(function(c){ return String(c).trim(); });
+      var hdr = rawHdr.map(function(c){ return c.toLowerCase().replace(/[^a-z0-9]/g,''); });
+      var custCol=-1, revCol=-1, costCol=-1, gpCol=-1, invCol=-1, prodCol=-1, qtyCol=-1;
       hdr.forEach(function(h,i){
-        if (h==='customername'||h==='customer name'||h==='customer'||h==='name'||h==='client') custCol=i;
-        if (h==='revenue'||h==='rev'||h==='totalrevenue'||h==='sales'||h==='amount') revCol=i;
-        if (h==='cost'||h==='totalcost') costCol=i;
-        if (h==='gp'||h==='grossprofitgrofit'||h==='grossprofit'||h==='profit'||h==='margin') gpCol=i;
-        if (h==='invoice'||h==='invoiceno'||h==='invoicenumber'||h==='docno') invCol=i;
-        if (h==='product'||h==='productname'||h==='item'||h==='description'||h==='sku'||h==='label'||h==='stockcode'||h==='code') prodCol=i;
-        if (h==='qty'||h==='quantity'||h==='units'||h==='volume') qtyCol=i;
+        if (/^(customername|customer|custname|cust|clientname|client|accountname|account|name)$/.test(h)) custCol=i;
+        if (/^(revenue|rev|totalrevenue|totalrev|sales|amount|netsales|nett|value|invoicevalue)$/.test(h)) revCol=i;
+        if (/^(cost|totalcost|costofgoods|cogs|costprice)$/.test(h)) costCol=i;
+        if (/^(gp|grossprofit|profit|margin|gpamount|gpvalue|nettprofit)$/.test(h)) gpCol=i;
+        if (/^(invoice|invoiceno|invoicenumber|docno|docnumber|orderno|ref)$/.test(h)) invCol=i;
+        if (/^(product|productname|productdesc|item|itemname|description|desc|sku|stockcode|code|itemcode|prodcode)$/.test(h)) prodCol=i;
+        if (/^(qty|quantity|units|volume|qtyinvoiced)$/.test(h)) qtyCol=i;
       });
+      // Fallback defaults if key columns still not found
+      if (custCol < 0) custCol = 0;
+      if (revCol  < 0) revCol  = hdr.findIndex(function(h){ return h.includes('rev') || h.includes('sales'); });
+      if (revCol  < 0) revCol  = 1;
       var isLineItem = prodCol >= 0;
+      status.textContent = '⏳ Columns detected — Customer:"' + rawHdr[custCol] + '" Revenue:"' + rawHdr[revCol] + '"'
+        + (isLineItem ? ' Product:"' + rawHdr[prodCol] + '"' : ' (no product col — aggregate mode)')
+        + ' | Mapping ' + (rows.length-1) + ' rows…';
 
       // Use in-memory _custMap (loaded from Supabase on startup); reload if empty
       var cmap = (Object.keys(_custMap||{}).length > 0) ? _custMap : {};
@@ -2748,13 +2758,9 @@ async function parseThenUploadSales(input) {
         custArr.sort(function(a,b){ return b.total_rev-a.total_rev; });
         custArr.forEach(function(c,i){ c.rank=i+1; c.gp_pct=c.total_rev>0?parseFloat((c.total_gp/c.total_rev*100).toFixed(1)):0; });
         try { localStorage.setItem('srp_top30_import', JSON.stringify({data:custArr, labels:prodLabels})); } catch(ex){}
-        // Cache for iframe (blob URLs can't access parent localStorage)
+        // Cache and push to iframe (with retries for race condition)
         window._top30Data = {data: custArr, labels: prodLabels};
-        // Push to iframe via postMessage
-        var _fr = document.getElementById('top30Frame');
-        if (_fr && _fr.contentWindow) {
-          try { _fr.contentWindow.postMessage({type:'srp_top30', payload: window._top30Data}, '*'); } catch(ex) {}
-        }
+        pushTop30ToFrame();
       }
 
       var output = {};
@@ -3008,12 +3014,24 @@ async function loadTop30Data() {
     var res = await sb.from('app_settings').select('value').eq('key','top30_product_data').single();
     if (res.data && res.data.value) {
       window._top30Data = res.data.value;
-      var fr = document.getElementById('top30Frame');
-      if (fr && fr.contentWindow) {
-        try { fr.contentWindow.postMessage({type:'srp_top30', payload: window._top30Data}, '*'); } catch(ex) {}
-      }
+      pushTop30ToFrame();
     }
   } catch(e) { console.warn('[SRP] loadTop30Data:', e); }
+}
+
+function pushTop30ToFrame() {
+  if (!window._top30Data) return;
+  var fr = document.getElementById('top30Frame');
+  if (!fr) return;
+  // Try immediately
+  try { fr.contentWindow.postMessage({type:'srp_top30', payload:window._top30Data},'*'); } catch(ex){}
+  // And retry after 800ms in case iframe wasn't ready yet
+  setTimeout(function(){
+    try { fr.contentWindow.postMessage({type:'srp_top30', payload:window._top30Data},'*'); } catch(ex){}
+  }, 800);
+  setTimeout(function(){
+    try { fr.contentWindow.postMessage({type:'srp_top30', payload:window._top30Data},'*'); } catch(ex){}
+  }, 2500);
 }
 
 function reloadTop30Frame() {
