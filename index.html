@@ -2757,7 +2757,7 @@ async function parseThenUploadSales(input) {
         Object.values(custProdMap).forEach(function(c){
           Object.keys(c.items).forEach(function(p){ prodRevMap[p]=(prodRevMap[p]||0)+(c.items[p].rev||0); });
         });
-        var prodLabels = Object.keys(prodRevMap).sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; }).slice(0,150);
+        var prodLabels = Object.keys(prodRevMap).sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; }).slice(0,50);
         var custArr = Object.values(custProdMap).map(function(c){
           var ci = {};
           prodLabels.forEach(function(p){ if(c.items[p]&&c.items[p].rev>0) ci[p]={rev:Math.round(c.items[p].rev*100)/100,qty:Math.round((c.items[p].qty||0)*10)/10}; });
@@ -2795,7 +2795,7 @@ async function parseThenUploadSales(input) {
           });
           var repLabels = Object.keys(prodRevMap)
             .sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; })
-            .slice(0,150);
+            .slice(0,50);
           // Compact: only keep items with rev>0, rounded to 2dp
           repCustArr = repCustArr.map(function(c){
             var compactItems = {};
@@ -2810,6 +2810,7 @@ async function parseThenUploadSales(input) {
                     items:compactItems};
           });
           repCustArr.sort(function(a,b){ return b.total_rev - a.total_rev; });
+          repCustArr = repCustArr.slice(0, 100); // limit to top 100 customers
           repCustArr.forEach(function(c,i){
             c.rank = i+1;
             c.gp_pct = c.total_rev>0 ? parseFloat((c.total_gp/c.total_rev*100).toFixed(1)) : 0;
@@ -2832,11 +2833,14 @@ async function parseThenUploadSales(input) {
       }
 
       status.textContent = '⏳ Saving ' + repCount + ' reps to Supabase…';
-      localStorage.setItem('srp_sales_data', JSON.stringify(output));
+      // Save slim version to localStorage (strip top30 to avoid quota)
+      var outputSlim = {};
+      Object.keys(output).forEach(function(rn){ var d=output[rn]; outputSlim[rn]={customers:d.customers,total_revenue:d.total_revenue,total_gp:d.total_gp,gp_pct:d.gp_pct,customer_count:d.customer_count,period:d.period}; });
+      try { localStorage.setItem('srp_sales_data', JSON.stringify(outputSlim)); } catch(ex){ console.warn('localStorage quota',ex); }
       renderSalesRepSummary(output);
 
       // Push to Supabase as single key (simpler, no key-matching issues)
-      localStorage.setItem('srp_sales_data_all', JSON.stringify(output));
+      try { localStorage.setItem('srp_sales_data_all', JSON.stringify(outputSlim)); } catch(ex){}
       var sb = _sbClient();
       if (sb) {
         status.textContent = '⏳ Saving to Supabase (' + repCount + ' reps)…';
@@ -3020,7 +3024,10 @@ async function uploadSalesData() {
       document.getElementById('salesUploadStatus').textContent = 'Saving… '+(i+1)+'/'+reps.length;
     }
     // Cache locally too
-    localStorage.setItem('srp_sales_data', JSON.stringify(_pendingSalesData));
+    // Save slim version (no top30) to localStorage to avoid quota
+    var _slim = {};
+    Object.keys(_pendingSalesData).forEach(function(rn){ var d=_pendingSalesData[rn]; _slim[rn]={customers:d.customers,total_revenue:d.total_revenue,total_gp:d.total_gp,gp_pct:d.gp_pct,customer_count:d.customer_count,period:d.period}; });
+    try { localStorage.setItem('srp_sales_data', JSON.stringify(_slim)); } catch(ex){}
     document.getElementById('salesUploadStatus').textContent = '✅ Saved ' + reps.length + ' reps to Supabase.';
     _pendingSalesData = null;
   } catch(err) {
