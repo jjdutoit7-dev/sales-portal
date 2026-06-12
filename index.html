@@ -2752,12 +2752,19 @@ async function parseThenUploadSales(input) {
       }
       // If line-item format, save product data to localStorage for Top 30 iframe
       if (isLineItem && prodSet.size > 0) {
-        var prodLabels = Array.from(prodSet);
-        var custArr = Object.values(custProdMap);
-        custArr.forEach(function(c){ prodLabels.forEach(function(p){ if(!c.items[p]) c.items[p]={rev:0,qty:0}; }); });
+        // Compact: top 150 products by revenue, no zero-fill
+        var prodRevMap = {};
+        Object.values(custProdMap).forEach(function(c){
+          Object.keys(c.items).forEach(function(p){ prodRevMap[p]=(prodRevMap[p]||0)+(c.items[p].rev||0); });
+        });
+        var prodLabels = Object.keys(prodRevMap).sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; }).slice(0,150);
+        var custArr = Object.values(custProdMap).map(function(c){
+          var ci = {};
+          prodLabels.forEach(function(p){ if(c.items[p]&&c.items[p].rev>0) ci[p]={rev:Math.round(c.items[p].rev*100)/100,qty:Math.round((c.items[p].qty||0)*10)/10}; });
+          return {name:c.name,rep:c.rep,code:c.code||'',total_rev:Math.round(c.total_rev*100)/100,total_gp:Math.round(c.total_gp*100)/100,items:ci};
+        });
         custArr.sort(function(a,b){ return b.total_rev-a.total_rev; });
         custArr.forEach(function(c,i){ c.rank=i+1; c.gp_pct=c.total_rev>0?parseFloat((c.total_gp/c.total_rev*100).toFixed(1)):0; });
-        try { localStorage.setItem('srp_top30_import', JSON.stringify({data:custArr, labels:prodLabels})); } catch(ex){}
         // Cache and push to iframe (with retries for race condition)
         window._top30Data = {data: custArr, labels: prodLabels};
         pushTop30ToFrame();
@@ -2775,14 +2782,33 @@ async function parseThenUploadSales(input) {
                   invoices:Object.keys(c.invoices).length};
         }).sort(function(a,b){return b.revenue-a.revenue;});
 
-        // Build per-rep Top30 iframe data (customer × product matrix)
+        // Build per-rep Top30 iframe data (customer × product matrix — compact, no zero-fill)
         var repTop30 = null;
         if (isLineItem) {
           var repCustArr = Object.values(custProdMap).filter(function(c){ return c.rep === rep; });
-          var repProdSet = new Set();
-          repCustArr.forEach(function(c){ Object.keys(c.items).forEach(function(p){ repProdSet.add(p); }); });
-          var repLabels = Array.from(repProdSet);
-          repCustArr.forEach(function(c){ repLabels.forEach(function(p){ if(!c.items[p]) c.items[p]={rev:0,qty:0}; }); });
+          // Collect only products with actual revenue, limit to top 150 by revenue
+          var prodRevMap = {};
+          repCustArr.forEach(function(c){
+            Object.keys(c.items).forEach(function(p){
+              prodRevMap[p] = (prodRevMap[p]||0) + (c.items[p].rev||0);
+            });
+          });
+          var repLabels = Object.keys(prodRevMap)
+            .sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; })
+            .slice(0,150);
+          // Compact: only keep items with rev>0, rounded to 2dp
+          repCustArr = repCustArr.map(function(c){
+            var compactItems = {};
+            repLabels.forEach(function(p){
+              if (c.items[p] && c.items[p].rev > 0) {
+                compactItems[p] = {rev: Math.round(c.items[p].rev*100)/100, qty: Math.round(c.items[p].qty*10)/10};
+              }
+            });
+            return {name:c.name, rep:c.rep, code:c.code||'',
+                    total_rev:Math.round(c.total_rev*100)/100,
+                    total_gp:Math.round(c.total_gp*100)/100,
+                    items:compactItems};
+          });
           repCustArr.sort(function(a,b){ return b.total_rev - a.total_rev; });
           repCustArr.forEach(function(c,i){
             c.rank = i+1;
@@ -2813,15 +2839,29 @@ async function parseThenUploadSales(input) {
       localStorage.setItem('srp_sales_data_all', JSON.stringify(output));
       var sb = _sbClient();
       if (sb) {
-        status.textContent = '⏳ Saving sales data to Supabase…';
-        var res = await sb.from('app_settings').upsert({key:'sales_data_all', value:output},{onConflict:'key'});
-        if (res.error) {
-          console.warn('[SRP] sales_data_all save error:', res.error);
-          status.textContent = '✅ Saved locally (' + repCount + ' reps). Supabase sync failed.';
-        } else {
-          status.textContent = '✅ Done — ' + repCount + ' reps, ' + matchedRows + ' rows matched (' + unmatchedRows + ' unmatched) saved to Supabase.';
+        status.textContent = '⏳ Saving to Supabase (' + repCount + ' reps)…';
+        var saveErrors = [];
+        // Save one key per rep to stay under payload limits
+        var repNames = Object.keys(output);
+        for (var ri = 0; ri < repNames.length; ri++) {
+          var rn = repNames[ri];
+          var repKey = 'sales_rep_' + rn.toLowerCase().replace(/[^a-z0-9]/g,'_');
+          var res = await sb.from('app_settings').upsert({key: repKey, value: output[rn]},{onConflict:'key'});
+          if (res.error) { saveErrors.push(rn); console.warn('[SRP] save error for', rn, res.error); }
         }
-
+        // Slim sales_data_all (no top30) for backward compat
+        var slim = {};
+        repNames.forEach(function(rn){
+          var d = output[rn];
+          slim[rn] = {customers:d.customers, total_revenue:d.total_revenue, total_gp:d.total_gp,
+                      gp_pct:d.gp_pct, customer_count:d.customer_count, period:d.period};
+        });
+        var idxRes = await sb.from('app_settings').upsert({key:'sales_data_all', value:slim},{onConflict:'key'});
+        if (saveErrors.length) {
+          status.textContent = '⚠️ Saved ' + (repCount-saveErrors.length) + '/' + repCount + ' reps. Failed: ' + saveErrors.join(', ');
+        } else {
+          status.textContent = '✅ Done — ' + repCount + ' reps, ' + matchedRows + ' matched (' + unmatchedRows + ' unmatched).';
+        }
       } else {
         status.textContent = '✅ Saved locally (' + repCount + ' reps). Supabase not connected.';
       }
@@ -3136,20 +3176,33 @@ async function loadMyRepSalesData() {
     return;
   }
 
-  // Rep: find this user's data — try all name variants as keys
+  // Rep: find this user's name key from slim index
   var usr_name   = (usr.name     || '').trim();
   var usr_uname  = (usr.username || '').trim();
   var variants   = [usr_name, usr_uname, usr_name.split(' ')[0], usr_uname.split('_')[0]].filter(Boolean);
   var keys = Object.keys(allData);
-  var hit = null;
-  for (var vi = 0; vi < variants.length && !hit; vi++) {
+  var matchedKey = null;
+  for (var vi = 0; vi < variants.length && !matchedKey; vi++) {
     var v = variants[vi].toLowerCase();
-    for (var ki = 0; ki < keys.length && !hit; ki++) {
+    for (var ki = 0; ki < keys.length && !matchedKey; ki++) {
       if (keys[ki].toLowerCase() === v || keys[ki].toLowerCase().startsWith(v)) {
-        hit = allData[keys[ki]];
+        matchedKey = keys[ki];
       }
     }
   }
+  if (!matchedKey) return;
+
+  // Load full rep data (with top30) from per-rep key
+  var hit = allData[matchedKey]; // slim version for now
+  var sb2 = _sbClient();
+  if (sb2) {
+    try {
+      var repKey = 'sales_rep_' + matchedKey.toLowerCase().replace(/[^a-z0-9]/g,'_');
+      var repRes = await sb2.from('app_settings').select('value').eq('key', repKey).single();
+      if (repRes.data && repRes.data.value) hit = repRes.data.value; // full version with top30
+    } catch(e2) { console.warn('[SRP] per-rep key load:', e2); }
+  }
+
   if (hit && hit.customers && hit.customers.length > 0) {
     window._mySalesData = hit;
     renderSalesKPIs();
