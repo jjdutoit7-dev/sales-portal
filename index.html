@@ -2757,7 +2757,7 @@ async function parseThenUploadSales(input) {
         Object.values(custProdMap).forEach(function(c){
           Object.keys(c.items).forEach(function(p){ prodRevMap[p]=(prodRevMap[p]||0)+(c.items[p].rev||0); });
         });
-        var prodLabels = Object.keys(prodRevMap).sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; }).slice(0,50);
+        var prodLabels = Object.keys(prodRevMap).sort(function(a,b){ return prodRevMap[b]-prodRevMap[a]; }).slice(0,25);
         var custArr = Object.values(custProdMap).map(function(c){
           var ci = {};
           prodLabels.forEach(function(p){ if(c.items[p]&&c.items[p].rev>0) ci[p]={rev:Math.round(c.items[p].rev*100)/100,qty:Math.round((c.items[p].qty||0)*10)/10}; });
@@ -2810,7 +2810,7 @@ async function parseThenUploadSales(input) {
                     items:compactItems};
           });
           repCustArr.sort(function(a,b){ return b.total_rev - a.total_rev; });
-          repCustArr = repCustArr.slice(0, 100); // limit to top 100 customers
+          repCustArr = repCustArr.slice(0, 30); // Top 30 is enough for the iframe // limit to top 100 customers
           repCustArr.forEach(function(c,i){
             c.rank = i+1;
             c.gp_pct = c.total_rev>0 ? parseFloat((c.total_gp/c.total_rev*100).toFixed(1)) : 0;
@@ -2843,9 +2843,27 @@ async function parseThenUploadSales(input) {
       try { localStorage.setItem('srp_sales_data_all', JSON.stringify(outputSlim)); } catch(ex){}
       var sb = _sbClient();
       if (sb) {
+        status.textContent = '⏳ Testing Supabase connection…';
+        // Quick write test before the loop — reveals RLS / config issues immediately
+        var testRes = await sb.from('app_settings').upsert({key:'_srp_test', value:{t:Date.now()}},{onConflict:'key'});
+        if (testRes.error) {
+          status.textContent = '❌ Supabase write blocked: ' + (testRes.error.message || testRes.error.code || JSON.stringify(testRes.error));
+          return;
+        }
         status.textContent = '⏳ Saving to Supabase (' + repCount + ' reps)…';
         var saveErrors = [];
-        // Save per-rep keys: summary (small) + top30 separate key (large product data)
+        var firstErrMsg = '';
+        // Helper: upsert by primary key (no onConflict needed if key is PK)
+        async function sbSave(key, val) {
+          // Try upsert without onConflict first (uses PK)
+          var r = await sb.from('app_settings').upsert({key:key, value:val});
+          if (!r.error) return null;
+          // Fallback: delete + insert
+          await sb.from('app_settings').delete().eq('key', key);
+          var ins = await sb.from('app_settings').insert({key:key, value:val});
+          return ins.error || null;
+        }
+        // Save per-rep keys: summary (small) + top30 as separate key
         var repNames = Object.keys(output);
         for (var ri = 0; ri < repNames.length; ri++) {
           var rn = repNames[ri];
@@ -2856,20 +2874,43 @@ async function parseThenUploadSales(input) {
                             total_gp:output[rn].total_gp, total_cost:output[rn].total_cost||0,
                             gp_pct:output[rn].gp_pct, customer_count:output[rn].customer_count,
                             period:output[rn].period};
-          var r1 = await sb.from('app_settings').upsert({key:repKey, value:repSummary},{onConflict:'key'});
-          if (r1.error) {
+          var e1 = await sbSave(repKey, repSummary);
+          if (e1) {
             saveErrors.push(rn);
-            console.warn('[SRP] summary save error', rn, r1.error.message||JSON.stringify(r1.error));
-            status.textContent = '⚠️ Error: ' + (r1.error.message||JSON.stringify(r1.error));
-          }
-          // Top30 row — only if line-item data exists
-          if (output[rn].top30) {
-            var r2 = await sb.from('app_settings').upsert({key:top30Key, value:output[rn].top30},{onConflict:'key'});
-            if (r2.error) {
-              console.warn('[SRP] top30 save error', rn, r2.error.message||JSON.stringify(r2.error));
+            if (!firstErrMsg) firstErrMsg = e1.message || JSON.stringify(e1);
+            console.warn('[SRP] summary save error', rn, e1);
+          } else if (output[rn].top30) {
+            var e2 = await sbSave(top30Key, output[rn].top30);
+            if (e2) {
+              console.warn('[SRP] top30 save error', rn, e2);
               if (!saveErrors.includes(rn)) saveErrors.push(rn+'(top30)');
             }
           }
+          status.textContent = '⏳ Saving… '+(ri+1)+'/'+repNames.length;
+        }
+        // Build combined admin top30 from all reps during save (pre-merged = single Supabase key)
+        var adminCustMap = {}, adminProdRevMap = {};
+        repNames.forEach(function(rn) {
+          var rt = output[rn].top30;
+          if (!rt || !rt.data) return;
+          rt.data.forEach(function(c) {
+            if (!adminCustMap[c.name]) adminCustMap[c.name]={name:c.name,rep:c.rep||'',code:c.code||'',total_rev:0,total_gp:0,items:{}};
+            adminCustMap[c.name].total_rev += c.total_rev||0;
+            adminCustMap[c.name].total_gp  += c.total_gp||0;
+            Object.keys(c.items||{}).forEach(function(p){
+              if(!adminCustMap[c.name].items[p]) adminCustMap[c.name].items[p]={rev:0,qty:0};
+              adminCustMap[c.name].items[p].rev += c.items[p].rev||0;
+              adminCustMap[c.name].items[p].qty += c.items[p].qty||0;
+              adminProdRevMap[p] = (adminProdRevMap[p]||0)+(c.items[p].rev||0);
+            });
+          });
+        });
+        var adminLabels = Object.keys(adminProdRevMap).sort(function(a,b){return adminProdRevMap[b]-adminProdRevMap[a];}).slice(0,25);
+        var adminCustArr = Object.values(adminCustMap).sort(function(a,b){return b.total_rev-a.total_rev;}).slice(0,30);
+        adminCustArr.forEach(function(c,i){c.rank=i+1;c.gp_pct=c.total_rev>0?parseFloat((c.total_gp/c.total_rev*100).toFixed(1)):0;});
+        if (adminCustArr.length > 0) {
+          var e3 = await sbSave('top30_admin', {data:adminCustArr, labels:adminLabels, period:period||'All Reps'});
+          if (e3) console.warn('[SRP] top30_admin save error', e3);
         }
         // Slim sales_data_all (no top30) for backward compat
         var slim = {};
@@ -2880,7 +2921,7 @@ async function parseThenUploadSales(input) {
         });
         var idxRes = await sb.from('app_settings').upsert({key:'sales_data_all', value:slim},{onConflict:'key'});
         if (saveErrors.length) {
-          status.textContent = '⚠️ Saved ' + (repCount-saveErrors.length) + '/' + repCount + ' reps. Failed: ' + saveErrors.join(', ');
+          status.textContent = '⚠️ Saved ' + (repCount-saveErrors.length) + '/' + repCount + ' reps. Failed: ' + saveErrors.join(', ') + (firstErrMsg ? ' | Error: ' + firstErrMsg : '');
         } else {
           status.textContent = '✅ Done — ' + repCount + ' reps, ' + matchedRows + ' matched (' + unmatchedRows + ' unmatched).';
         }
@@ -3172,43 +3213,19 @@ async function loadMyRepSalesData() {
     if (combined.length > 0) {
       window._mySalesData = { customers: combined, period: 'All Reps' };
       renderSalesKPIs();
-      // Admin top30: allData is slim (no top30) — fetch per-rep full keys in parallel
-      var adminCustMap = {};
-      var adminProdSet = new Set();
+      // Admin top30: load pre-built combined key (built during import save)
       var sb3 = _sbClient();
       if (sb3) {
         try {
-          var repNameList = Object.keys(allData);
-          var repFetches = repNameList.map(function(rn) {
-            var rk = 'top30_rep_' + rn.toLowerCase().replace(/[^a-z0-9]/g,'_');
-            return sb3.from('app_settings').select('value').eq('key', rk).single();
-          });
-          var repResults = await Promise.all(repFetches);
-          repResults.forEach(function(res) {
-            if (!res || !res.data || !res.data.value) return;
-            var rd = res.data.value; // this IS the top30 object {data,labels,period}
-            if (!rd.data) return;
-            (rd.labels||[]).forEach(function(l){ adminProdSet.add(l); });
-            rd.data.forEach(function(c) {
-              if (!adminCustMap[c.name]) adminCustMap[c.name] = {name:c.name,rep:c.rep||'',code:c.code||'',total_rev:0,total_gp:0,items:{}};
-              adminCustMap[c.name].total_rev += c.total_rev||0;
-              adminCustMap[c.name].total_gp  += c.total_gp||0;
-              Object.keys(c.items||{}).forEach(function(p){
-                if (!adminCustMap[c.name].items[p]) adminCustMap[c.name].items[p]={rev:0,qty:0};
-                adminCustMap[c.name].items[p].rev += c.items[p].rev||0;
-                adminCustMap[c.name].items[p].qty += c.items[p].qty||0;
-              });
-            });
-          });
-        } catch(e3) { console.warn('[SRP] admin top30 fetch:', e3); }
-      }
-      var adminLabels = Array.from(adminProdSet);
-      var adminCustArr = Object.values(adminCustMap);
-      adminCustArr.sort(function(a,b){ return b.total_rev-a.total_rev; });
-      adminCustArr.forEach(function(c,i){ c.rank=i+1; c.gp_pct=c.total_rev>0?parseFloat((c.total_gp/c.total_rev*100).toFixed(1)):0; });
-      if (adminCustArr.length > 0) {
-        window._top30Data = {data: adminCustArr, labels: adminLabels, period: 'All Reps'};
-        pushTop30ToFrame();
+          var adminRes = await sb3.from('app_settings').select('value').eq('key','top30_admin').single();
+          if (adminRes.data && adminRes.data.value) {
+            var rd = adminRes.data.value;
+            if (rd.data && rd.data.length > 0) {
+              window._top30Data = rd;
+              pushTop30ToFrame();
+            }
+          }
+        } catch(e3) { console.warn('[SRP] admin top30 load:', e3); }
       }
     }
     return;
