@@ -2681,16 +2681,39 @@ async function parseThenUploadSales(input) {
         cmap = _custMap || {};
         cmapSize = Object.keys(cmap).length;
       }
-      status.textContent = '⏳ Parsed ' + (rows.length-1) + ' rows, mapping to ' + cmapSize + ' known customers…';
+      status.textContent = '⏳ Parsed ' + (rows.length-1) + ' rows, matching against ' + cmapSize + ' mapped customers…';
+
+      // Build normalised lookup: lowercase+stripped → rep name
+      var cmapNorm = {};
+      Object.keys(cmap).forEach(function(k) {
+        cmapNorm[k.toLowerCase().replace(/\s+/g,' ').trim()] = cmap[k];
+      });
+      function lookupRep(name) {
+        if (!name) return null;
+        var n = name.toLowerCase().replace(/\s+/g,' ').trim();
+        // exact normalised match
+        if (cmapNorm[n]) return cmapNorm[n].rep;
+        // strip common suffixes
+        var stripped = n.replace(/\s*[-–]\s*b2b$/i,'').replace(/\s*\(.*?\)$/,'').trim();
+        if (cmapNorm[stripped]) return cmapNorm[stripped].rep;
+        // partial: find any key that starts with first 6 chars
+        var prefix = n.slice(0,6);
+        var keys = Object.keys(cmapNorm);
+        for (var ki=0; ki<keys.length; ki++) {
+          if (keys[ki].startsWith(prefix)) return cmapNorm[keys[ki]].rep;
+        }
+        return null;
+      }
 
       var repAgg = {}, custProdMap = {}, prodSet = new Set();
+      var matchedRows = 0, unmatchedRows = 0;
       for (var i=1;i<rows.length;i++) {
         var r = rows[i];
         var cust = String(r[custCol]||'').trim();
         if (!cust) continue;
-        var repEntry = cmap[cust] || cmap[cust.replace(/-B2B$/,'').replace(/ -B2B$/,'').trim()];
-        var rep = repEntry ? repEntry.rep : null;
-        if (!rep) continue;
+        var rep = lookupRep(cust);
+        if (!rep) { unmatchedRows++; continue; }
+        matchedRows++;
         var rev  = parseFloat(r[revCol])  || 0;
         var cost = parseFloat(r[costCol]) || 0;
         var gp   = parseFloat(r[gpCol])   || 0;
@@ -2752,7 +2775,7 @@ async function parseThenUploadSales(input) {
 
       var repCount = Object.keys(output).length;
       if (repCount === 0) {
-        status.textContent = '⚠️ 0 customers matched — upload the Customer Mapping file first (🏢 Customers tab)';
+        status.textContent = '⚠️ 0 customers matched out of ' + (matchedRows+unmatchedRows) + ' rows — check customer map in 🏢 Customers tab. First row sample: ' + String(rows[1] ? rows[1][custCol] : 'empty');
         renderSalesRepSummary(output);
         return;
       }
@@ -2771,7 +2794,7 @@ async function parseThenUploadSales(input) {
           console.warn('[SRP] sales_data_all save error:', res.error);
           status.textContent = '✅ Saved locally (' + repCount + ' reps). Supabase sync failed.';
         } else {
-          status.textContent = '✅ Done — ' + repCount + ' reps saved to Supabase.';
+          status.textContent = '✅ Done — ' + repCount + ' reps, ' + matchedRows + ' rows matched (' + unmatchedRows + ' unmatched) saved to Supabase.';
         }
         // Also persist Top 30 product data to Supabase
         if (window._top30Data) {
