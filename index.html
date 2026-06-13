@@ -815,8 +815,12 @@
 <!-- ═══════════════════════════════════════════════
      TAB: TOP 30
 ══════════════════════════════════════════════════ -->
-<div class="tab-content" id="tab-top30" style="height:calc(100vh - 56px);padding:0;overflow:hidden;">
-  <iframe id="top30Frame" style="width:100%;height:100%;border:none;" allowfullscreen></iframe>
+<div class="tab-content" id="tab-top30" style="height:calc(100vh - 56px);padding:0;overflow:hidden;display:flex;flex-direction:column;">
+  <div id="top30DebugBar" style="display:flex;align-items:center;gap:8px;padding:4px 10px;background:#1a1a2e;font-size:11px;color:#aaa;flex-shrink:0;">
+    <span id="top30DebugMsg">Loading…</span>
+    <button onclick="top30ForceLoad()" style="margin-left:auto;padding:3px 10px;font-size:11px;background:#0066cc;color:#fff;border:none;border-radius:4px;cursor:pointer;">⟳ Reload</button>
+  </div>
+  <iframe id="top30Frame" style="width:100%;flex:1;border:none;" allowfullscreen></iframe>
 </div>
 <div class="tab-content" id="tab-products" style="padding:16px;">
   <h2 style="margin:0 0 12px;font-size:16px;color:var(--text)">Product Selection</h2>
@@ -1024,7 +1028,16 @@ function switchTab(tab) {
     if ((nt.getAttribute('data-tab')||'') === tab) nt.classList.add('active');
   });
   const tabOrder = ['dashboard','tasks','calls','pipeline','quotation','analysis','top30','products','activity','customers','sales'];
-  if (tab === 'top30') { loadTop30Data(); }
+  if (tab === 'top30') {
+    if (window._top30Data) {
+      var d = window._top30Data;
+      top30SetDebug('📊 ' + (d.data||[]).length + ' customers · ' + (d.labels||[]).length + ' products · ' + (d.period||''));
+      pushTop30ToFrame();
+    } else {
+      top30SetDebug('⏳ Loading…');
+      loadTop30Data();
+    }
+  }
   const navTabs = document.querySelectorAll('.nav-tab');
   const tidx = tabOrder.indexOf(tab);
   if (tidx >= 0 && navTabs[tidx]) navTabs[tidx].classList.add('active');
@@ -3136,13 +3149,38 @@ async function loadTop30Data() {
   await loadMyRepSalesData();
 }
 
+function top30SetDebug(msg) {
+  var el = document.getElementById('top30DebugMsg');
+  if (el) el.textContent = msg;
+}
+
+async function top30ForceLoad() {
+  top30SetDebug('⏳ Loading from Supabase…');
+  window._top30Data = null;
+  await loadMyRepSalesData();
+  if (window._top30Data) {
+    top30SetDebug('✅ ' + (window._top30Data.data||[]).length + ' customers, ' + (window._top30Data.labels||[]).length + ' products — pushing…');
+    pushTop30ToFrame();
+  } else {
+    var sb = _sbClient();
+    var keys = [];
+    if (sb) {
+      try {
+        var r = await sb.from('app_settings').select('key').like('key','top30%');
+        keys = (r.data||[]).map(function(x){return x.key;});
+      } catch(e) {}
+    }
+    top30SetDebug('❌ No top30 data. Keys found: [' + keys.join(', ') + ']. Re-import sales file first.');
+  }
+}
+
 function pushTop30ToFrame() {
   if (!window._top30Data) return;
   var fr = document.getElementById('top30Frame');
   if (!fr) return;
-  // Try immediately
+  var d = window._top30Data;
+  top30SetDebug('📊 ' + (d.data||[]).length + ' customers · ' + (d.labels||[]).length + ' products · ' + (d.period||''));
   try { fr.contentWindow.postMessage({type:'srp_top30', payload:window._top30Data},'*'); } catch(ex){}
-  // And retry after 800ms in case iframe wasn't ready yet
   setTimeout(function(){
     try { fr.contentWindow.postMessage({type:'srp_top30', payload:window._top30Data},'*'); } catch(ex){}
   }, 800);
