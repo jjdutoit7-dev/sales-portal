@@ -2864,13 +2864,13 @@ async function parseThenUploadSales(input) {
       var sb = _sbClient();
       if (sb) {
         status.textContent = '⏳ Testing Supabase connection…';
-        // Quick write test before the loop — reveals RLS / config issues immediately
-        var testRes = await sb.from('app_settings').upsert({key:'_srp_test', value:{t:Date.now()}},{onConflict:'key'});
-        if (testRes.error) {
-          status.textContent = '❌ Supabase write blocked: ' + (testRes.error.message || testRes.error.code || JSON.stringify(testRes.error));
-          return;
-        }
-        status.textContent = '⏳ Saving to Supabase (' + repCount + ' reps)…';
+        var _sbWriteOk = false;
+        try {
+          var testRes = await sb.from('app_settings').upsert({key:'_srp_test', value:{t:Date.now()}},{onConflict:'key'});
+          _sbWriteOk = !testRes.error;
+          if (!_sbWriteOk) console.warn('[SRP] Supabase write test failed:', testRes.error);
+        } catch(ex) { console.warn('[SRP] Supabase write test exception:', ex); }
+        status.textContent = _sbWriteOk ? '⏳ Saving to Supabase (' + repCount + ' reps)…' : '⚠️ Supabase offline — saving locally only…';
         var saveErrors = [];
         var firstErrMsg = '';
         // Helper: upsert by primary key (no onConflict needed if key is PK)
@@ -2910,6 +2910,7 @@ async function parseThenUploadSales(input) {
           status.textContent = '⏳ Saving… '+(ri+1)+'/'+repNames.length;
         }
         // Build combined admin top30 from all reps during save (pre-merged = single Supabase key)
+        // Push to iframe immediately — works even without Supabase
         var adminCustMap = {}, adminProdRevMap = {};
         repNames.forEach(function(rn) {
           var rt = output[rn].top30;
@@ -2930,8 +2931,16 @@ async function parseThenUploadSales(input) {
         var adminCustArr = Object.values(adminCustMap).sort(function(a,b){return b.total_rev-a.total_rev;}).slice(0,30);
         adminCustArr.forEach(function(c,i){c.rank=i+1;c.gp_pct=c.total_rev>0?parseFloat((c.total_gp/c.total_rev*100).toFixed(1)):0;});
         if (adminCustArr.length > 0) {
-          var e3 = await sbSave('top30_admin', {data:adminCustArr, labels:adminLabels, period:period||'All Reps'});
-          if (e3) console.warn('[SRP] top30_admin save error', e3);
+          var top30AdminPayload = {data:adminCustArr, labels:adminLabels, period:period||'All Reps'};
+          // Push to iframe right now (works without Supabase)
+          window._top30Data = top30AdminPayload;
+          pushTop30ToFrame();
+          // Save locally so it survives page reload
+          try { localStorage.setItem('srp_top30_admin', JSON.stringify(top30AdminPayload)); } catch(ex){}
+          // Save to Supabase in background (best-effort)
+          if (_sbWriteOk) {
+            sbSave('top30_admin', top30AdminPayload).then(function(e3){ if(e3) console.warn('[SRP] top30_admin save error', e3); });
+          }
         }
         // Slim sales_data_all (no top30) for backward compat
         var slim = {};
@@ -3259,19 +3268,27 @@ async function loadMyRepSalesData() {
     if (combined.length > 0) {
       window._mySalesData = { customers: combined, period: 'All Reps' };
       renderSalesKPIs();
-      // Admin top30: load pre-built combined key (built during import save)
-      var sb3 = _sbClient();
-      if (sb3) {
-        try {
-          var adminRes = await sb3.from('app_settings').select('value').eq('key','top30_admin').single();
-          if (adminRes.data && adminRes.data.value) {
-            var rd = adminRes.data.value;
-            if (rd.data && rd.data.length > 0) {
-              window._top30Data = rd;
-              pushTop30ToFrame();
+      // Admin top30: check localStorage first, then Supabase
+      var _cachedAdminTop30 = null;
+      try { var _t = localStorage.getItem('srp_top30_admin'); if (_t) _cachedAdminTop30 = JSON.parse(_t); } catch(ex){}
+      if (_cachedAdminTop30 && _cachedAdminTop30.data && _cachedAdminTop30.data.length > 0) {
+        window._top30Data = _cachedAdminTop30;
+        pushTop30ToFrame();
+      } else {
+        var sb3 = _sbClient();
+        if (sb3) {
+          try {
+            var adminRes = await sb3.from('app_settings').select('value').eq('key','top30_admin').single();
+            if (adminRes.data && adminRes.data.value) {
+              var rd = adminRes.data.value;
+              if (rd.data && rd.data.length > 0) {
+                window._top30Data = rd;
+                try { localStorage.setItem('srp_top30_admin', JSON.stringify(rd)); } catch(ex){}
+                pushTop30ToFrame();
+              }
             }
-          }
-        } catch(e3) { console.warn('[SRP] admin top30 load:', e3); }
+          } catch(e3) { console.warn('[SRP] admin top30 load:', e3); }
+        }
       }
     }
     return;
