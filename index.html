@@ -2875,7 +2875,7 @@ async function parseThenUploadSales(input) {
         var firstErrMsg = '';
         // Helper: upsert by primary key (no onConflict needed if key is PK)
         async function sbSave(key, val) {
-          // Try upsert without onConflict first (uses PK)
+          if (!_sbWriteOk) return {message:'Supabase offline'};
           var r = await sb.from('app_settings').upsert({key:key, value:val});
           if (!r.error) return null;
           // Fallback: delete + insert
@@ -2885,7 +2885,8 @@ async function parseThenUploadSales(input) {
         }
         // Save per-rep keys: summary (small) + top30 as separate key
         var repNames = Object.keys(output);
-        if (repNames.length === 0) { status.textContent = '⏳ No reps matched — saving Top 30 only…'; }
+        if (!_sbWriteOk) { status.textContent = '⚠️ Supabase offline — Top 30 built locally, rep KPIs not persisted.'; }
+        if (_sbWriteOk && repNames.length === 0) { status.textContent = '⏳ No reps matched — saving Top 30 only…'; }
         for (var ri = 0; ri < repNames.length; ri++) {
           var rn = repNames[ri];
           var repKey   = 'sales_rep_' + rn.toLowerCase().replace(/[^a-z0-9]/g,'_');
@@ -2950,7 +2951,9 @@ async function parseThenUploadSales(input) {
                       gp_pct:d.gp_pct, customer_count:d.customer_count, period:d.period};
         });
         var idxRes = await sb.from('app_settings').upsert({key:'sales_data_all', value:slim},{onConflict:'key'});
-        if (saveErrors.length) {
+        if (!_sbWriteOk) {
+          // Already set status above — don't overwrite with save errors
+        } else if (saveErrors.length) {
           status.textContent = '⚠️ Saved ' + (repCount-saveErrors.length) + '/' + repCount + ' reps. Failed: ' + saveErrors.join(', ') + (firstErrMsg ? ' | Error: ' + firstErrMsg : '');
         } else {
           status.textContent = '✅ Done — ' + repCount + ' reps, ' + matchedRows + ' matched (' + unmatchedRows + ' unmatched).';
