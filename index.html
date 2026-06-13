@@ -2735,27 +2735,31 @@ async function parseThenUploadSales(input) {
         var cust = String(r[custCol]||'').trim();
         if (!cust) continue;
         var rep = lookupRep(cust);
-        if (!rep) { unmatchedRows++; continue; }
-        matchedRows++;
         var rev  = parseFloat(r[revCol])  || 0;
         var cost = parseFloat(r[costCol]) || 0;
         var gp   = parseFloat(r[gpCol])   || 0;
         var inv  = String(r[invCol]||'').trim();
         var prod = isLineItem ? String(r[prodCol]||'').trim() : null;
         var qty  = (isLineItem && qtyCol>=0) ? (parseFloat(r[qtyCol])||0) : 0;
-        if (!repAgg[rep]) repAgg[rep] = {customers:{}, total_revenue:0, total_gp:0, total_cost:0};
-        repAgg[rep].total_revenue += rev;
-        repAgg[rep].total_gp      += gp;
-        repAgg[rep].total_cost    += cost;
-        if (!repAgg[rep].customers[cust]) repAgg[rep].customers[cust]={revenue:0,gp:0,cost:0,invoices:{}};
-        repAgg[rep].customers[cust].revenue += rev;
-        repAgg[rep].customers[cust].gp      += gp;
-        repAgg[rep].customers[cust].cost    += cost;
-        if (inv) repAgg[rep].customers[cust].invoices[inv]=1;
-        // Line-item: also aggregate by customer × product for Top 30 iframe
+        // Per-rep KPIs: only customers matched in customer map
+        if (rep) {
+          matchedRows++;
+          if (!repAgg[rep]) repAgg[rep] = {customers:{}, total_revenue:0, total_gp:0, total_cost:0};
+          repAgg[rep].total_revenue += rev;
+          repAgg[rep].total_gp      += gp;
+          repAgg[rep].total_cost    += cost;
+          if (!repAgg[rep].customers[cust]) repAgg[rep].customers[cust]={revenue:0,gp:0,cost:0,invoices:{}};
+          repAgg[rep].customers[cust].revenue += rev;
+          repAgg[rep].customers[cust].gp      += gp;
+          repAgg[rep].customers[cust].cost    += cost;
+          if (inv) repAgg[rep].customers[cust].invoices[inv]=1;
+        } else {
+          unmatchedRows++;
+        }
+        // Top 30: include ALL customers regardless of rep match
         if (prod) {
           prodSet.add(prod);
-          if (!custProdMap[cust]) custProdMap[cust]={name:cust,rep:rep||'?',code:'',total_rev:0,total_gp:0,items:{}};
+          if (!custProdMap[cust]) custProdMap[cust]={name:cust,rep:rep||'',code:'',total_rev:0,total_gp:0,items:{}};
           custProdMap[cust].total_rev += rev;
           custProdMap[cust].total_gp  += gp;
           if (!custProdMap[cust].items[prod]) custProdMap[cust].items[prod]={rev:0,qty:0};
@@ -2839,13 +2843,16 @@ async function parseThenUploadSales(input) {
       });
 
       var repCount = Object.keys(output).length;
-      if (repCount === 0) {
-        status.textContent = '⚠️ 0 customers matched out of ' + (matchedRows+unmatchedRows) + ' rows — check customer map in 🏢 Customers tab. First row sample: ' + String(rows[1] ? rows[1][custCol] : 'empty');
-        renderSalesRepSummary(output);
+      var top30CustCount = Object.keys(custProdMap).length;
+      if (repCount === 0 && top30CustCount === 0) {
+        status.textContent = '⚠️ 0 rows matched. Check customer map in 🏢 Customers tab. First row sample: ' + String(rows[1] ? rows[1][custCol] : 'empty');
         return;
       }
+      if (repCount === 0) {
+        status.textContent = '⚠️ No customer map matches — per-rep KPIs skipped. Building Top 30 from all ' + top30CustCount + ' customers…';
+      }
 
-      status.textContent = '⏳ Saving ' + repCount + ' reps to Supabase…';
+      status.textContent = '⏳ Saving ' + (repCount||'0') + ' reps + Top 30 to Supabase…';
       // Save slim version to localStorage (strip top30 to avoid quota)
       var outputSlim = {};
       Object.keys(output).forEach(function(rn){ var d=output[rn]; outputSlim[rn]={customers:d.customers,total_revenue:d.total_revenue,total_gp:d.total_gp,gp_pct:d.gp_pct,customer_count:d.customer_count,period:d.period}; });
@@ -2878,6 +2885,7 @@ async function parseThenUploadSales(input) {
         }
         // Save per-rep keys: summary (small) + top30 as separate key
         var repNames = Object.keys(output);
+        if (repNames.length === 0) { status.textContent = '⏳ No reps matched — saving Top 30 only…'; }
         for (var ri = 0; ri < repNames.length; ri++) {
           var rn = repNames[ri];
           var repKey   = 'sales_rep_' + rn.toLowerCase().replace(/[^a-z0-9]/g,'_');
